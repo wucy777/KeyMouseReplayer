@@ -11,16 +11,22 @@
     24  : i32    virtual height
     28  : u32    payload raw byte length
     32  : u32    payload stored byte length
-    36  : u32    reserved
+    36  : u32    mouse_mode（v1 为保留字段恒 0：0=绝对坐标 1=相对增量）
     40  : payload
 
 payload: count 条 24 字节记录（小端）
     i32 kind
-    i32 a     (按键=虚拟键码；鼠标键=按钮号；滚轮=增量；移动=X 坐标)
-    i32 b     (按键=扫描码；鼠标键/滚轮=X 坐标；移动=Y 坐标)
+    i32 a     (按键=虚拟键码；鼠标键=按钮号；滚轮=增量；移动=X 坐标；相对移动=dx)
+    i32 b     (按键=扫描码；鼠标键/滚轮=X 坐标；移动=Y 坐标；相对移动=dy)
     i32 c     (按键=extended 标志；鼠标键/滚轮=Y 坐标；移动=0)
     i32 dt_us 距上一条的微秒数（i32 上限约 35.8 分钟，录制侧超 30 分钟按 30 分钟记）
     i32 flags 预留
+
+两种鼠标模式（v2 引入，事件 kind 2/7 互斥出现）：
+    绝对坐标（0）：普通程序。移动/点击按物理像素坐标注入，回放中手碰鼠标
+                   会被下一条事件自动拉回。
+    相对增量（1）：光标被游戏捕获/隐藏的全屏游戏。移动按 SendInput 相对增量
+                   注入，点击/滚轮不携带移动标志（落在当前光标处=镜头处）。
 
 单条 24 字节 + 表头，10 万条约 2.4MB，压缩后通常 <1MB。
 写入走 array.tobytes，读取走 frombytes，无 Python 循环，毫秒级完成。
@@ -34,11 +40,14 @@ import zlib
 from dataclasses import dataclass, field
 
 MAGIC = b"KMS1"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 FLAG_ZLIB = 0x0001
 HEADER_SIZE = 40
 STRIDE = 6
 DEFAULT_EXT = ".kms"
+
+MOUSE_MODE_ABS = 0
+MOUSE_MODE_REL = 1
 
 # 载入时的事件条数上限（高于录制侧 MAX_EVENTS，留余量）：防止损坏/恶意文件
 # 用超大 count 或 zlib 炸弹把内存吃光
@@ -60,6 +69,7 @@ class Script:
     screen: tuple[int, int, int, int] = (0, 0, 1920, 1080)
     name: str = ""
     source: str = ""  # 文件路径，空表示仅内存中
+    mouse_mode: int = MOUSE_MODE_ABS
 
     @property
     def duration_us(self) -> int:
@@ -90,7 +100,7 @@ def serialize(script: Script, compress: bool = True) -> bytes:
     header = _HEADER.pack(
         MAGIC, FORMAT_VERSION, flags, script.count,
         left, top, width, height,
-        len(raw), len(payload), 0,
+        len(raw), len(payload), script.mouse_mode,
     )
     return header + payload
 
@@ -98,11 +108,13 @@ def serialize(script: Script, compress: bool = True) -> bytes:
 def deserialize(data: bytes) -> Script:
     if len(data) < HEADER_SIZE:
         raise ValueError("文件太小，不是有效的脚本文件")
-    magic, ver, flags, count, left, top, width, height, raw_len, stored_len, _ = _HEADER.unpack_from(data, 0)
+    magic, ver, flags, count, left, top, width, height, raw_len, stored_len, mouse_mode = _HEADER.unpack_from(data, 0)
     if magic != MAGIC:
         raise ValueError("文件头不是 KMS1，可能是旧版或损坏的脚本")
-    if ver != FORMAT_VERSION:
+    if ver not in (1, FORMAT_VERSION):
         raise ValueError(f"脚本格式版本 {ver} 与当前程序 {FORMAT_VERSION} 不兼容")
+    if mouse_mode not in (MOUSE_MODE_ABS, MOUSE_MODE_REL):
+        raise ValueError("鼠标模式字段异常，文件可能已损坏")
     if count > MAX_LOAD_EVENTS:
         raise ValueError("事件条数异常，文件可能已损坏")
     expected = count * STRIDE * 4
@@ -121,7 +133,8 @@ def deserialize(data: bytes) -> Script:
             raise ValueError("脚本内容不完整")
     events = array.array("i")
     events.frombytes(raw)
-    return Script(events=events, count=count, screen=(left, top, width, height))
+    return Script(events=events, count=count, screen=(left, top, width, height),
+                  mouse_mode=mouse_mode)
 
 
 def save_file(path: str, script: Script, compress: bool = True) -> int:

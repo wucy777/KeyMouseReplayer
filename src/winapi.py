@@ -105,6 +105,7 @@ K_BUTTON_DOWN = 3
 K_BUTTON_UP = 4
 K_WHEEL = 5
 K_HWHEEL = 6
+K_MOUSE_REL = 7
 
 KIND_NAMES = {
     K_KEY_DOWN: "按键按下",
@@ -114,6 +115,7 @@ KIND_NAMES = {
     K_BUTTON_UP: "鼠标抬起",
     K_WHEEL: "滚轮",
     K_HWHEEL: "横向滚轮",
+    K_MOUSE_REL: "相对移动",
 }
 
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_X1, BTN_X2 = 0, 1, 2, 3, 4
@@ -592,6 +594,149 @@ def send_inputs_array(arr) -> int:
 
 def vk_to_scan(vk: int) -> int:
     return int(user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) & 0xFF
+
+
+# ---------------------------------------------------------------- Raw Input（相对增量录制）
+# 全屏游戏中光标被钉在中心，WH_MOUSE_LL 读到的"光标位置"没有意义；
+# 游戏视角读的是鼠标相对增量。Raw Input 是与游戏同一数据源：
+# RegisterRawInputDevices(RIDEV_INPUTSINK) 后台收 WM_INPUT，读 RAWMOUSE.lLastX/lLastY。
+WM_INPUT = 0x00FF
+RIM_INPUT = 0
+RIM_INPUTSINK = 1
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+RIDEV_INPUTSINK = 0x00000100
+MOUSE_MOVE_ABSOLUTE = 0x0001  # usFlags 置位表示绝对设备（触屏/RDP），不进相对流
+
+HWND_MESSAGE = ctypes.c_void_p(-3)
+
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [
+        ("usUsagePage", w.USHORT),
+        ("usUsage", w.USHORT),
+        ("dwFlags", w.DWORD),
+        ("hwndTarget", w.HWND),
+    ]
+
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [
+        ("dwType", w.DWORD),
+        ("dwSize", w.DWORD),
+        ("hDevice", w.HANDLE),
+        ("wParam", ctypes.c_size_t),
+    ]
+
+
+class _RAWMOUSE_BTN(ctypes.Structure):
+    _fields_ = [("usButtonFlags", w.USHORT), ("usButtonData", w.USHORT)]
+
+
+class _RAWMOUSE_U(ctypes.Union):
+    _fields_ = [("ulButtons", w.ULONG), ("btn", _RAWMOUSE_BTN)]
+
+
+class RAWMOUSE(ctypes.Structure):
+    _fields_ = [
+        ("usFlags", w.USHORT),
+        ("u", _RAWMOUSE_U),
+        ("ulRawButtons", w.ULONG),
+        ("lLastX", w.LONG),
+        ("lLastY", w.LONG),
+        ("ulExtraInformation", w.ULONG),
+    ]
+
+
+class RAWINPUT(ctypes.Structure):
+    """只声明 mouse 分支：data 联合体各成员偏移相同，够用。"""
+
+    _fields_ = [("header", RAWINPUTHEADER), ("mouse", RAWMOUSE)]
+
+
+WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style", w.UINT),
+        ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", w.HINSTANCE),
+        ("hIcon", w.HINSTANCE),
+        ("hCursor", w.HANDLE),
+        ("hbrBackground", w.HANDLE),
+        ("lpszMenuName", w.LPCWSTR),
+        ("lpszClassName", w.LPCWSTR),
+    ]
+
+
+user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), w.UINT, w.UINT]
+user32.RegisterRawInputDevices.restype = w.BOOL
+user32.GetRawInputData.argtypes = [w.HANDLE, w.UINT, ctypes.c_void_p,
+                                   ctypes.POINTER(w.UINT), w.UINT]
+user32.GetRawInputData.restype = w.UINT
+user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+user32.RegisterClassW.restype = w.ATOM
+user32.UnregisterClassW.argtypes = [w.LPCWSTR, w.HINSTANCE]
+user32.UnregisterClassW.restype = w.BOOL
+user32.CreateWindowExW.argtypes = [w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   w.HWND, w.HANDLE, w.HINSTANCE, ctypes.c_void_p]
+user32.CreateWindowExW.restype = w.HWND
+user32.DefWindowProcW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+user32.DefWindowProcW.restype = ctypes.c_ssize_t
+user32.DestroyWindow.argtypes = [w.HWND]
+user32.DestroyWindow.restype = w.BOOL
+kernel32.GetModuleHandleW.argtypes = [w.LPCWSTR]
+kernel32.GetModuleHandleW.restype = w.HINSTANCE
+
+# 注入事件（SendInput）没有设备句柄，header.hDevice 为 NULL；
+# RDP/终端服务下真实事件也可能为 NULL，属已知边缘（见 README）。
+
+
+def register_raw_mouse(hwnd) -> bool:
+    """注册鼠标 Raw Input（后台接收，不抢焦点）。hwnd 为接收 WM_INPUT 的窗口。"""
+    dev = RAWINPUTDEVICE(1, 2, RIDEV_INPUTSINK, hwnd)  # usage page 1, usage 2 = 鼠标
+    return bool(user32.RegisterRawInputDevices(ctypes.byref(dev), 1, ctypes.sizeof(RAWINPUTDEVICE)))
+
+
+import itertools as _it
+
+_WINDOW_SEQ = _it.count(1)
+
+
+def create_message_window(wndproc) -> tuple[int, str] | None:
+    """创建 message-only 窗口（不可见、不进任务栏），返回 (hwnd, class_name)。
+
+    每次调用注册**独立**窗口类：WNDPROC 回调绑定在窗口类上，进程内多个
+    Recorder 实例并存时（测试/自检会连续创建）必须各自持有自己的回调，
+    复用同名类会让 WM_INPUT 全部进第一个实例的回调。
+    """
+    class_name = f"KMR_RawInput_{next(_WINDOW_SEQ)}"
+    wc = WNDCLASSW()
+    wc.lpfnWndProc = wndproc
+    wc.lpszClassName = class_name
+    wc.hInstance = kernel32.GetModuleHandleW(None)
+    if not user32.RegisterClassW(ctypes.byref(wc)):
+        return None
+    hwnd = user32.CreateWindowExW(
+        0, class_name, None, 0, 0, 0, 0, 0,
+        HWND_MESSAGE, None, wc.hInstance, None,
+    )
+    if not hwnd:
+        user32.UnregisterClassW(class_name, wc.hInstance)
+        return None
+    return hwnd, class_name
+
+
+def destroy_message_window(hwnd, class_name: str) -> None:
+    """销毁窗口并反注册窗口类（须在创建它的线程上调用）。"""
+    if hwnd:
+        user32.DestroyWindow(hwnd)
+    if class_name:
+        user32.UnregisterClassW(class_name, kernel32.GetModuleHandleW(None))
 
 
 # ---------------------------------------------------------------- Tk 收尾

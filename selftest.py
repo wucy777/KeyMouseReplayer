@@ -281,6 +281,128 @@ def test_pause_repress() -> None:
         W.send_inputs = orig
 
 
+def test_format_v1_compat() -> None:
+    """v1 旧脚本按绝对模式读出；v2 的模式字段往返保留。"""
+    print("\n[1b] v1/v2 格式兼容")
+    from src.script_io import MOUSE_MODE_ABS, MOUSE_MODE_REL, Script
+    s = make_script(10)
+    blob = script_io.serialize(s)
+    check("v2 头版本号", blob[4] == 2, f"ver={blob[4]}")
+    b1 = blob[:4] + (1).to_bytes(2, "little") + blob[6:]
+    s1 = script_io.deserialize(b1)
+    check("v1 头按绝对模式读出", s1.mouse_mode == MOUSE_MODE_ABS and s1.count == 10)
+    srel = Script(events=s.events, count=10, screen=s.screen, mouse_mode=MOUSE_MODE_REL)
+    s2 = script_io.deserialize(script_io.serialize(srel))
+    check("v2 相对模式往返", s2.mouse_mode == MOUSE_MODE_REL and s2.events == s.events)
+
+
+def test_detect_and_strip() -> None:
+    """双轨判定：桌面 1:1 判绝对，光标被钉 + 大增量判相对（含混录段）；裁剪保时长。"""
+    print("\n[3b] 双轨判定与裁剪")
+    from src.script_io import MOUSE_MODE_ABS, MOUSE_MODE_REL
+
+    # 桌面：光标 1:1 移动 399px，相对增量累计 400px → 判绝对
+    ev_desktop = array.array("i")
+    for i in range(400):
+        ev_desktop.extend((W.K_MOUSE_MOVE, 100 + i, 200, 0, 8000, 0))
+        ev_desktop.extend((W.K_MOUSE_REL, 1, 0, 0, 4000, 0))
+    mode, info = analysis.detect_mouse_mode(ev_desktop, len(ev_desktop) // STRIDE)
+    check("桌面 1:1 判为绝对", mode == MOUSE_MODE_ABS, str(info))
+
+    # 捕获：光标钉在中心，相对增量累计 3200px → 判相对
+    ev_game = array.array("i")
+    for i in range(400):
+        ev_game.extend((W.K_MOUSE_MOVE, 640, 400, 0, 8000, 0))
+        ev_game.extend((W.K_MOUSE_REL, 5, 3, 0, 4000, 0))
+    mode, info = analysis.detect_mouse_mode(ev_game, len(ev_game) // STRIDE)
+    check("捕获场景判为相对", mode == MOUSE_MODE_REL, str(info))
+
+    # 混录：前 300 事件桌面、后 300 捕获 → 判相对（任意位置可识别）
+    ev_mixed = array.array("i")
+    for i in range(150):
+        ev_mixed.extend((W.K_MOUSE_MOVE, 100 + i, 200, 0, 8000, 0))
+        ev_mixed.extend((W.K_MOUSE_REL, 1, 0, 0, 4000, 0))
+    for i in range(150):
+        ev_mixed.extend((W.K_MOUSE_MOVE, 640, 400, 0, 8000, 0))
+        ev_mixed.extend((W.K_MOUSE_REL, 5, 3, 0, 4000, 0))
+    mode, _ = analysis.detect_mouse_mode(ev_mixed, len(ev_mixed) // STRIDE)
+    check("混录（桌面+游戏）判为相对", mode == MOUSE_MODE_REL)
+
+    # 裁剪：模式无关的总时长必须逐微秒保留；按键/点击/滚轮不受影响
+    ev = array.array("i")
+    for i in range(50):
+        ev.extend((W.K_MOUSE_MOVE, 100 + i, 200, 0, 8000, 0))
+        ev.extend((W.K_MOUSE_REL, -2, 1, 0, 3000, 0))
+    ev.extend((W.K_KEY_DOWN, 0x41, 0x1E, 0, 5000, 0))
+    ev.extend((W.K_BUTTON_DOWN, W.BTN_LEFT, 500, 300, 6000, 0))
+    ev.extend((W.K_WHEEL, 120, 500, 300, 7000, 0))
+    ev.extend((W.K_KEY_UP, 0x41, 0x1E, 0, 2000, 0))
+    n = len(ev) // STRIDE
+    total_before = sum(ev[i] for i in range(4, len(ev), STRIDE))
+    for target in (MOUSE_MODE_ABS, MOUSE_MODE_REL):
+        kept, kept_cnt = analysis.strip_to_mode(ev, n, target)
+        total_after = sum(kept[i] for i in range(4, len(kept), STRIDE))
+        dropped = W.K_MOUSE_REL if target == MOUSE_MODE_ABS else W.K_MOUSE_MOVE
+        kinds = {kept[i * STRIDE] for i in range(kept_cnt)}
+        check(f"裁剪到{('相对' if target else '绝对')}后总时长不变", total_before == total_after)
+        check(f"裁剪到{('相对' if target else '绝对')}后被裁类型清零", dropped not in kinds, f"kinds={sorted(kinds)}")
+        check(f"裁剪到{('相对' if target else '绝对')}后按键点击滚轮保留",
+              {W.K_KEY_DOWN, W.K_BUTTON_DOWN, W.K_WHEEL, W.K_KEY_UP} <= kinds)
+
+
+def test_rel_roundtrip() -> None:
+    """相对增量录制 → 相对回放 → 再录制，增量总和必须一致。
+
+    SendInput 相对注入在 Raw Input 里没有设备句柄（hDevice=NULL），
+    打开 allow_injected 才能录到。
+    """
+    print("\n[8] 相对增量 录制→回放 往返")
+    from src.player import Player
+    from src.recorder import Recorder
+    from src.script_io import MOUSE_MODE_REL, Script
+
+    rec = Recorder()
+    rec.allow_injected = True
+    rec.start()
+    check("Raw Input 已注册", rec.raw_ok)
+    rec.start_recording()
+    for i in range(20):
+        W.send_inputs([W.make_mouse_input(3, 2, 0, W.MOUSEEVENTF_MOVE)])
+        time.sleep(0.015)
+    time.sleep(0.15)
+    rec.stop_recording()
+    buf, cnt = rec.take_events()
+    rec.stop()
+    rel = [(buf[i * STRIDE + 1], buf[i * STRIDE + 2])
+           for i in range(cnt) if buf[i * STRIDE] == W.K_MOUSE_REL]
+    absn = sum(1 for i in range(cnt) if buf[i * STRIDE] == W.K_MOUSE_MOVE)
+    check("相对增量全量录到（Σdx=60 Σdy=40）",
+          sum(dx for dx, _ in rel) == 60 and sum(dy for _, dy in rel) == 40,
+          f"{len(rel)} 条相对 / {absn} 条绝对")
+    check("绝对轨迹同时记录（双轨）", absn > 0, f"{absn} 条")
+
+    s_ev, s_cnt = analysis.strip_to_mode(buf, cnt, MOUSE_MODE_REL)
+    script = Script(events=s_ev, count=s_cnt, screen=W.refresh_virtual_screen(),
+                    mouse_mode=MOUSE_MODE_REL)
+
+    rec2 = Recorder()
+    rec2.allow_injected = True
+    rec2.start()
+    rec2.start_recording()
+    p = Player()
+    p.play(script, 0, 8.0)
+    p.wait(10)
+    time.sleep(0.2)
+    rec2.stop_recording()
+    buf2, cnt2 = rec2.take_events()
+    rec2.stop()
+    rel2 = [(buf2[i * STRIDE + 1], buf2[i * STRIDE + 2])
+            for i in range(cnt2) if buf2[i * STRIDE] == W.K_MOUSE_REL]
+    check("回放增量被完整录回（Σdx=60 Σdy=40）",
+          sum(dx for dx, _ in rel2) == 60 and sum(dy for _, dy in rel2) == 40,
+          f"{len(rel2)} 条")
+
+
 def test_recorder_pipeline() -> None:
     """验证钩子链路：安装 -> 注入合成事件 -> 被录到 -> 状态机 -> 停录。
 
@@ -382,7 +504,8 @@ def test_wheel_encoding() -> None:
             rec.start()
             rec.start_recording()
             time.sleep(0.12)
-            Player._send_wheel(delta, W.MOUSEEVENTF_WHEEL, 500, 400)
+            Player._send_wheel(delta, W.MOUSEEVENTF_WHEEL, 500, 400,
+                               W.MOUSEEVENTF_MOVE | W.MOUSEEVENTF_ABSOLUTE | W.MOUSEEVENTF_VIRTUALDESK)
             time.sleep(0.2)
             rec.stop_recording()
             buf, cnt = rec.take_events()
@@ -452,13 +575,17 @@ def main() -> int:
     W.set_dpi_awareness()
     if which in ("all", "core"):
         test_serialize()
+        test_format_v1_compat()
         test_file_roundtrip(tmpdir)
         test_analysis()
+        test_detect_and_strip()
         test_player_dry_run()
         test_pause_repress()
         test_coordinate_math()
     if which in ("all", "hook"):
         test_recorder_pipeline()
+    if which in ("all", "rel"):
+        test_rel_roundtrip()
     if which in ("all", "wheel"):
         test_wheel_encoding()
     if which in ("all", "ui"):

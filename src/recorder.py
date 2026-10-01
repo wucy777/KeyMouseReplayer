@@ -1,11 +1,18 @@
-"""录制引擎：低级键鼠钩子 -> 紧凑事件缓冲。
+"""录制引擎：低级键鼠钩子 + Raw Input -> 紧凑事件缓冲。
 
 内存方案：
 - 事件不建对象，直接写入预分配的 array('i')（每条 6 个 int32 = 24 字节）。
 - 块式存储，绝不整表复制扩容；上万条事件约 0.24MB，百万条约 24MB。
 - 记录期间不落盘、不格式化、无 GC 压力。
 
-鼠标移动降采样（时间/距离阈值）由 UI 层调参后写入，默认开启。
+鼠标移动有两路来源（「自动检测」模式下双轨同录，存盘时二选一）：
+- 绝对坐标（kind2）：WH_MOUSE_LL 钩子读光标物理像素位置，普通程序用。
+- 相对增量（kind7）：Raw Input WM_INPUT 读 RAWMOUSE.lLastX/lLastY。
+  光标被游戏捕获/隐藏时，钩子读到的光标位置被钉在中心没有意义，
+  而 Raw Input 与游戏视角读的是同一数据源，不受重置影响。
+  原始回报可达 1000Hz，按 move_min_interval_us 聚合成事件，总位移精确。
+
+record_mode：0=自动检测（双轨） 1=强制绝对 2=强制相对。
 """
 from __future__ import annotations
 
@@ -61,6 +68,7 @@ class Recorder:
         self.on_event = on_event
         self.on_state_change = None
         # 默认忽略本程序自己注入的事件（否则回放会被自己录进去）。
+        # 对 Raw Input 同样生效：注入事件没有设备句柄（hDevice 为 NULL）。
         # 自检脚本会临时打开它来验证钩子链路。
         self.allow_injected = False
         self._hotkeys: dict[int, tuple[int, object]] = {}
@@ -71,6 +79,19 @@ class Recorder:
         self._ms_req = threading.Event()
         self._ms_ok = False
         self._pump_running = False
+        # 鼠标模式：0=自动检测（双轨） 1=强制绝对 2=强制相对
+        self.record_mode = 0
+        # Raw Input（相对增量）
+        self._raw_hwnd = None
+        self._raw_class = None
+        self._raw_proc = None
+        self._raw_buf = (ctypes.c_byte * 128)()
+        self._raw_registered = False
+        self._rel_acc_x = 0
+        self._rel_acc_y = 0
+        self._rel_last_emit_us = 0
+        # 回放期间屏蔽真实鼠标移动（LL 钩子吞掉非注入的移动）
+        self._block_real_mouse = False
 
     # ------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -86,6 +107,40 @@ class Recorder:
     def kb_hook_ok(self) -> bool:
         """常驻键盘钩子是否安装成功（失败则快捷键和键盘录制都不可用）。"""
         return self._kb_hook is not None
+
+    @property
+    def raw_ok(self) -> bool:
+        """Raw Input 是否注册成功（失败则相对增量不可录）。"""
+        return self._raw_registered
+
+    @property
+    def block_real_mouse(self) -> bool:
+        return self._block_real_mouse
+
+    def set_block_real_mouse(self, enabled: bool) -> bool:
+        """回放期间屏蔽真实鼠标移动（吞掉非注入的移动事件）。
+
+        开启期间真实鼠标无法移动，全局快捷键（键盘钩子）不受影响。
+        返回 False 表示启用失败（钩子安装不成功），调用方应提示并回退。
+        """
+        self._block_real_mouse = enabled
+        if enabled:
+            if not self._ms_hook:
+                try:
+                    self._install_mouse_hook_on_pump()
+                except OSError:
+                    self._block_real_mouse = False
+                    return False
+            return True
+        if not self._recording and self._ms_hook:
+            self._ms_req.clear()
+            posted = self._pump_running and W.user32.PostThreadMessageW(
+                self._thread_id, _WM_UNINSTALL_MOUSE, 0, 0)
+            if posted:
+                self._ms_req.wait(2.0)
+            if self._ms_hook:  # 钩子线程没响应时兜底
+                self._uninstall_mouse_hook()
+        return True
 
     def stop(self) -> None:
         if not self._running:
@@ -119,6 +174,9 @@ class Recorder:
             self._last_mx = -1
             self._last_my = -1
             self._last_move_us = 0
+            self._rel_acc_x = 0
+            self._rel_acc_y = 0
+            self._rel_last_emit_us = self._last_us
             self._recording = True
         W.refresh_virtual_screen()
         try:
@@ -144,6 +202,48 @@ class Recorder:
                 self._uninstall_mouse_hook()
         if was and self.on_state_change:
             self.on_state_change(False)
+
+    def _flush_rel(self, now: int | None = None) -> None:
+        """把聚合中的相对增量落成一条事件（仅钩子线程调用）。
+
+        聚合窗口内的 dx/dy 累加合并，总位移精确；dt 由 _push 统一计。"""
+        if self._rel_acc_x == 0 and self._rel_acc_y == 0:
+            return
+        ax, ay = self._rel_acc_x, self._rel_acc_y
+        self._rel_acc_x = 0
+        self._rel_acc_y = 0
+        if now is None:
+            now = time.perf_counter_ns() // 1000
+        self._rel_last_emit_us = now
+        self._push(W.K_MOUSE_REL, ax, ay, 0, 0)
+
+    def _on_raw_input(self, lparam) -> None:
+        """WM_INPUT：读鼠标相对增量，按间隔聚合（仅钩子线程）。"""
+        size = ctypes.wintypes.UINT(ctypes.sizeof(self._raw_buf))
+        r = W.user32.GetRawInputData(lparam, W.RID_INPUT, self._raw_buf,
+                                     ctypes.byref(size), ctypes.sizeof(W.RAWINPUTHEADER))
+        if r == 0xFFFFFFFF or size.value < ctypes.sizeof(W.RAWINPUT):
+            return
+        ri = ctypes.cast(self._raw_buf, ctypes.POINTER(W.RAWINPUT)).contents
+        if ri.header.dwType != W.RIM_TYPEMOUSE:
+            return
+        m = ri.mouse
+        if m.usFlags & W.MOUSE_MOVE_ABSOLUTE:
+            return  # 绝对设备（触屏/RDP/数位板）不进相对流
+        if not self.allow_injected and not ri.header.hDevice:
+            return  # 注入事件没有设备句柄，默认忽略防自录
+        if self.record_mode == 1:
+            return  # 强制绝对：不记相对流
+        now = time.perf_counter_ns() // 1000
+        self._rel_acc_x += m.lLastX
+        self._rel_acc_y += m.lLastY
+        if now - self._rel_last_emit_us >= self.move_min_interval_us:
+            self._flush_rel(now)
+
+    def _raw_wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == W.WM_INPUT:
+            self._on_raw_input(lparam)
+        return W.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     @property
     def recording(self) -> bool:
@@ -215,6 +315,13 @@ class Recorder:
         if not self._kb_hook:
             self._ready.set()
             return
+        # Raw Input：message-only 窗口 + 后台接收（RIDEV_INPUTSINK），
+        # 与钩子同在泵线程——所有录制回调单线程，聚合状态无需加锁
+        self._raw_proc = W.WNDPROC(self._raw_wndproc)
+        win = W.create_message_window(self._raw_proc)
+        if win:
+            self._raw_hwnd, self._raw_class = win
+            self._raw_registered = W.register_raw_mouse(self._raw_hwnd)
         self._pump_running = True
         self._ready.set()
         msg = ctypes.wintypes.MSG()
@@ -232,12 +339,17 @@ class Recorder:
                     self._ms_ok = False
                 self._ms_req.set()
             elif m == _WM_UNINSTALL_MOUSE:
+                self._flush_rel()  # 录制收尾：把聚合中的相对增量落盘
                 self._uninstall_mouse_hook()
                 self._ms_req.set()
             else:
                 W.user32.TranslateMessage(ctypes.byref(msg))
                 W.user32.DispatchMessageW(ctypes.byref(msg))
         self._pump_running = False
+        if self._raw_hwnd or self._raw_class:
+            W.destroy_message_window(self._raw_hwnd, self._raw_class)
+            self._raw_hwnd = None
+            self._raw_class = None
         self._uninstall_mouse_hook()
         if self._kb_hook:
             W.user32.UnhookWindowsHookEx(self._kb_hook)
@@ -288,42 +400,51 @@ class Recorder:
         return W.user32.CallNextHookEx(None, ncode, wparam, ctypes.cast(lparam, ctypes.c_void_p))
 
     def _mouse_cb(self, ncode, wparam, lparam):
-        if ncode == 0 and self._recording:
+        if ncode == 0:
             info = lparam.contents
-            flags = info.flags
-            if self.allow_injected or not (flags & (W.LLMHF_INJECTED | W.LLMHF_LOWER_IL_INJECTED)):
+            injected = bool(info.flags & (W.LLMHF_INJECTED | W.LLMHF_LOWER_IL_INJECTED))
+            # 回放屏蔽：吞掉真实（非注入）的移动事件——不转发，游戏也收不到。
+            # 注入事件必须放行，否则回放的移动会被自己吞掉。
+            if self._block_real_mouse and not injected and wparam == W.WM_MOUSEMOVE:
+                return 1
+            if self._recording and (self.allow_injected or not injected):
                 msg = wparam
                 if msg == W.WM_MOUSEMOVE:
                     self._on_move(info.pt.x, info.pt.y)
-                elif msg == W.WM_LBUTTONDOWN:
-                    self._push(W.K_BUTTON_DOWN, W.BTN_LEFT, info.pt.x, info.pt.y, 0)
-                elif msg == W.WM_LBUTTONUP:
-                    self._push(W.K_BUTTON_UP, W.BTN_LEFT, info.pt.x, info.pt.y, 0)
-                elif msg == W.WM_RBUTTONDOWN:
-                    self._push(W.K_BUTTON_DOWN, W.BTN_RIGHT, info.pt.x, info.pt.y, 0)
-                elif msg == W.WM_RBUTTONUP:
-                    self._push(W.K_BUTTON_UP, W.BTN_RIGHT, info.pt.x, info.pt.y, 0)
-                elif msg == W.WM_MBUTTONDOWN:
-                    self._push(W.K_BUTTON_DOWN, W.BTN_MIDDLE, info.pt.x, info.pt.y, 0)
-                elif msg == W.WM_MBUTTONUP:
-                    self._push(W.K_BUTTON_UP, W.BTN_MIDDLE, info.pt.x, info.pt.y, 0)
-                elif msg == W.WM_XBUTTONDOWN or msg == W.WM_XBUTTONUP:
-                    xbtn = (info.mouseData >> 16) & 0xFFFF
-                    btn = W.BTN_X1 if xbtn == W.XBUTTON1 else W.BTN_X2
-                    self._push(
-                        W.K_BUTTON_DOWN if msg == W.WM_XBUTTONDOWN else W.K_BUTTON_UP,
-                        btn, info.pt.x, info.pt.y, 0,
-                    )
-                elif msg == W.WM_MOUSEWHEEL:
-                    # 钩子里滚轮增量在高 16 位（与 SendInput 的有符号 32 位约定不同）
-                    delta = ctypes.c_short((info.mouseData >> 16) & 0xFFFF).value
-                    self._push(W.K_WHEEL, delta, info.pt.x, info.pt.y, 0)
-                elif msg == W.WM_MOUSEHWHEEL:
-                    delta = ctypes.c_short((info.mouseData >> 16) & 0xFFFF).value
-                    self._push(W.K_HWHEEL, delta, info.pt.x, info.pt.y, 0)
+                else:
+                    # 点击/滚轮的坐标语义在其发生的瞬间，先把聚合中的相对增量落盘
+                    self._flush_rel()
+                    if msg == W.WM_LBUTTONDOWN:
+                        self._push(W.K_BUTTON_DOWN, W.BTN_LEFT, info.pt.x, info.pt.y, 0)
+                    elif msg == W.WM_LBUTTONUP:
+                        self._push(W.K_BUTTON_UP, W.BTN_LEFT, info.pt.x, info.pt.y, 0)
+                    elif msg == W.WM_RBUTTONDOWN:
+                        self._push(W.K_BUTTON_DOWN, W.BTN_RIGHT, info.pt.x, info.pt.y, 0)
+                    elif msg == W.WM_RBUTTONUP:
+                        self._push(W.K_BUTTON_UP, W.BTN_RIGHT, info.pt.x, info.pt.y, 0)
+                    elif msg == W.WM_MBUTTONDOWN:
+                        self._push(W.K_BUTTON_DOWN, W.BTN_MIDDLE, info.pt.x, info.pt.y, 0)
+                    elif msg == W.WM_MBUTTONUP:
+                        self._push(W.K_BUTTON_UP, W.BTN_MIDDLE, info.pt.x, info.pt.y, 0)
+                    elif msg == W.WM_XBUTTONDOWN or msg == W.WM_XBUTTONUP:
+                        xbtn = (info.mouseData >> 16) & 0xFFFF
+                        btn = W.BTN_X1 if xbtn == W.XBUTTON1 else W.BTN_X2
+                        self._push(
+                            W.K_BUTTON_DOWN if msg == W.WM_XBUTTONDOWN else W.K_BUTTON_UP,
+                            btn, info.pt.x, info.pt.y, 0,
+                        )
+                    elif msg == W.WM_MOUSEWHEEL:
+                        # 钩子里滚轮增量在高 16 位（与 SendInput 的有符号 32 位约定不同）
+                        delta = ctypes.c_short((info.mouseData >> 16) & 0xFFFF).value
+                        self._push(W.K_WHEEL, delta, info.pt.x, info.pt.y, 0)
+                    elif msg == W.WM_MOUSEHWHEEL:
+                        delta = ctypes.c_short((info.mouseData >> 16) & 0xFFFF).value
+                        self._push(W.K_HWHEEL, delta, info.pt.x, info.pt.y, 0)
         return W.user32.CallNextHookEx(None, ncode, wparam, ctypes.cast(lparam, ctypes.c_void_p))
 
     def _on_move(self, x: int, y: int) -> None:
+        if self.record_mode == 2:
+            return  # 强制相对：不记绝对轨迹
         now = time.perf_counter_ns() // 1000
         if self.move_min_interval_us and (now - self._last_move_us) < self.move_min_interval_us:
             return

@@ -102,6 +102,7 @@ class App(ctk.CTk):
         self.script_name = "未载入"
         self.move_min_interval = 8
         self.move_min_distance = 2
+        self.record_mode_setting = 0  # 0=自动检测 1=强制绝对 2=强制相对
         self.compress_on_save = True
         self.last_dir = os.path.join(os.path.expanduser("~"), "Documents")
 
@@ -164,6 +165,9 @@ class App(ctk.CTk):
         if not self.recorder.kb_hook_ok:
             msgs.append("• 全局键盘钩子安装失败，快捷键和录制都无法工作。\n"
                         "  请尝试以管理员身份运行本程序。")
+        if not self.recorder.raw_ok:
+            msgs.append("• Raw Input 不可用：无法记录相对增量，\n"
+                        "  捕获/隐藏鼠标的游戏（视角操作）将录不到移动，普通程序不受影响。")
         if not self.elevated:
             msgs.append("• 当前不是管理员权限（可能是在 UAC 提示中选择了「否」）。\n"
                         "  若目标程序以管理员运行，将收不到它的键鼠事件、也无法把操作回放给它。\n"
@@ -308,6 +312,13 @@ class App(ctk.CTk):
                                         font=(FONT, 14), fg_color=CARD2, hover_color="#2C3140",
                                         command=self.play_from_position)
         self.btn_resume.pack(side="right")
+        # 相对增量脚本回放时，真实鼠标的移动会叠加进游戏视角；
+        # 勾选后由 LL 钩子吞掉非注入的移动（键盘/热键不受影响），暂停期间自动放开
+        self.var_block_mouse = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(row, text="回放时屏蔽真实鼠标", variable=self.var_block_mouse,
+                        font=(FONT, 12), width=150, checkbox_width=16, checkbox_height=16,
+                        corner_radius=5, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                        command=self._update_block).pack(side="right", padx=(0, 10))
 
         # 进度
         prog = ctk.CTkFrame(ctrl, fg_color="transparent")
@@ -355,9 +366,9 @@ class App(ctk.CTk):
         prev.grid_columnconfigure(0, weight=1)
         prev.grid_rowconfigure(1, weight=1)
         prev.grid_columnconfigure(1, weight=0)
-        ctk.CTkLabel(prev, text="操作预览（仅显示前 300 条，避免大脚本卡顿）",
-                     font=(FONT, 12), text_color=MUTED).grid(row=0, column=0, columnspan=2,
-                                                             sticky="w", pady=(0, 4))
+        self._preview_title = ctk.CTkLabel(prev, text="操作预览（仅显示前 300 条，避免大脚本卡顿）",
+                                           font=(FONT, 12), text_color=MUTED)
+        self._preview_title.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
         # 用原生 tk.Text 而不是 CTkTextbox：CTkTextbox 内部有一个 200ms 的
         # 滚动条自轮询（用于动态显隐滚动条），脚本预览是只读文本，不需要它，
         # 少一个轮询就少一份开销，也免去它在销毁后触发回调的麻烦。
@@ -446,20 +457,34 @@ class App(ctk.CTk):
         self.sl_md.set(2)
         self.sl_md.grid(row=10, column=1, columnspan=3, sticky="w", pady=5)
 
-        ctk.CTkLabel(card, text="脚本文件", font=(FONT, 16, "bold"), text_color=TEXT).grid(
+        ctk.CTkLabel(card, text="鼠标模式", font=(FONT, 16, "bold"), text_color=TEXT).grid(
             row=11, column=0, columnspan=4, sticky="w", padx=20, pady=(20, 4))
+        ctk.CTkLabel(card, text="自动检测：录制时同时记录两路，存盘时识别——光标被游戏捕获/隐藏\n"
+                               "（视角、镜头类操作）用「相对增量」，普通程序用「绝对坐标」。",
+                     font=(FONT, 12), text_color=MUTED, justify="left").grid(
+            row=12, column=0, columnspan=4, sticky="w", padx=20, pady=(0, 6))
+        self.var_record_mode = tk.StringVar(value="自动检测")
+        ctk.CTkOptionMenu(card, values=["自动检测", "绝对坐标", "相对（游戏）"],
+                          variable=self.var_record_mode, width=150, height=30,
+                          font=(FONT, 12), fg_color=CARD2, button_color=CARD2,
+                          button_hover_color="#2C3140", corner_radius=8,
+                          command=self._on_record_mode).grid(
+            row=13, column=0, sticky="w", padx=20, pady=(0, 4))
+
+        ctk.CTkLabel(card, text="脚本文件", font=(FONT, 16, "bold"), text_color=TEXT).grid(
+            row=14, column=0, columnspan=4, sticky="w", padx=20, pady=(20, 4))
         self.var_compress = tk.BooleanVar(value=True)
         ctk.CTkCheckBox(card, text="保存时压缩（体积约减小 60~80%，读取速度几乎无差异）",
                         variable=self.var_compress, font=(FONT, 12), checkbox_width=18, checkbox_height=18,
                         corner_radius=5, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                        command=self._on_compress).grid(row=12, column=0, columnspan=4, sticky="w",
+                        command=self._on_compress).grid(row=15, column=0, columnspan=4, sticky="w",
                                                         padx=20, pady=(0, 4))
 
         # ---- 运行权限
         ctk.CTkLabel(card, text="运行权限", font=(FONT, 16, "bold"), text_color=TEXT).grid(
-            row=13, column=0, columnspan=4, sticky="w", padx=20, pady=(20, 4))
+            row=16, column=0, columnspan=4, sticky="w", padx=20, pady=(20, 4))
         priv = ctk.CTkFrame(card, fg_color="transparent")
-        priv.grid(row=14, column=0, columnspan=4, sticky="w", padx=20, pady=(0, 18))
+        priv.grid(row=17, column=0, columnspan=4, sticky="w", padx=20, pady=(0, 18))
         self.lbl_priv = ctk.CTkLabel(
             priv,
             text=("已以管理员权限运行" if self.elevated
@@ -599,6 +624,7 @@ class App(ctk.CTk):
             return
         self.recorder.move_min_interval_us = self.move_min_interval * 1000
         self.recorder.move_min_distance = self.move_min_distance
+        self.recorder.record_mode = self.record_mode_setting
         try:
             self.recorder.start_recording()
         except OSError as exc:
@@ -624,7 +650,25 @@ class App(ctk.CTk):
         if cnt == 0:
             dialogs.info(self, "本次没有记录到任何操作。")
             return
-        scr = Script(events=buf, count=cnt, screen=W.refresh_virtual_screen(), name="")
+        # 双轨判定：自动模式下两路都录了，存盘时判模式并裁掉另一路
+        # （被裁事件的 dt 并入相邻事件，总时长与绝对时刻零误差）
+        if self.record_mode_setting == 0:
+            mode, info = analysis.detect_mouse_mode(buf, cnt)
+            if mode == script_io.MOUSE_MODE_REL:
+                dialogs.info(self, "检测到光标被游戏捕获，已按「相对增量」模式保存。\n"
+                                   "回放时移动以增量注入，点击/滚轮落在当前光标处。", "已识别游戏模式")
+            elif info.get("pinned_light"):
+                dialogs.warning(self, "光标几乎未移动，像是处在捕获鼠标的游戏中，\n"
+                                      "但没有记录到相对增量（Raw Input 不可用？）。\n"
+                                      "本次仍按绝对坐标保存，回放移动可能无效。", "录制提示")
+        else:
+            mode = script_io.MOUSE_MODE_ABS if self.record_mode_setting == 1 else script_io.MOUSE_MODE_REL
+        buf, cnt = analysis.strip_to_mode(buf, cnt, mode)
+        if cnt == 0:
+            dialogs.info(self, "本次没有记录到任何操作。")
+            return
+        scr = Script(events=buf, count=cnt, screen=W.refresh_virtual_screen(),
+                     name="", mouse_mode=mode)
         ts = time.strftime("%Y%m%d-%H%M%S")
         scr.name = f"录制-{ts}"
         self._set_script(scr)
@@ -676,6 +720,7 @@ class App(ctk.CTk):
         scr = self.script
         if scr is None:
             return
+        mode_text = "相对增量模式" if scr.mouse_mode == script_io.MOUSE_MODE_REL else "绝对坐标模式"
         ev = scr.events
         lines = []
         t = 0
@@ -691,6 +736,8 @@ class App(ctk.CTk):
         self.preview.delete("1.0", "end")
         self.preview.insert("1.0", "\n".join(lines))
         self.preview.configure(state="disabled")
+        # 标题带上模式，载入的脚本是什么回放方式一眼可见
+        self._preview_title.configure(text=f"操作预览 · {mode_text}（仅显示前 300 条，避免大脚本卡顿）")
 
     @staticmethod
     def _describe(ev, base: int) -> str:
@@ -698,6 +745,8 @@ class App(ctk.CTk):
         a = ev[base + 1]
         if kind == W.K_MOUSE_MOVE:
             return f"鼠标移动  ->  ({a}, {ev[base + 2]})"
+        if kind == W.K_MOUSE_REL:
+            return f"相对移动  dx={a:+d}, dy={ev[base + 2]:+d}"
         if kind == W.K_BUTTON_DOWN:
             return f"{W.BTN_NAMES.get(a, a)} 按下  @({ev[base + 2]}, {ev[base + 3]})"
         if kind == W.K_BUTTON_UP:
@@ -818,6 +867,7 @@ class App(ctk.CTk):
             ):
                 return
         self.player.play(self.script, start_index=start, speed=self._read_speed())
+        self._update_block()
         self.btn_pause.configure(state="normal", text=f"⏸  暂停  ({self.hk_pause.label()})")
         self.btn_stop.configure(state="normal")
         self.btn_play.configure(state="disabled")
@@ -825,10 +875,25 @@ class App(ctk.CTk):
         self.lbl_state.configure(text="回放中", text_color=OK_GREEN)
         self.side_status.configure(text="● 回放中", text_color=OK_GREEN)
 
+    def _update_block(self) -> None:
+        """按当前播放状态启停「屏蔽真实鼠标」：播放中生效，暂停/结束后放开。"""
+        want = self.var_block_mouse.get() and self.player.playing and not self.player.paused
+        if want and not self.recorder.block_real_mouse:
+            try:
+                ok = self.recorder.set_block_real_mouse(True)
+            except OSError:
+                ok = False
+            if not ok:
+                self.var_block_mouse.set(False)
+                dialogs.warning(self, "鼠标钩子安装失败，无法屏蔽真实鼠标。", "屏蔽不可用")
+        elif not want and self.recorder.block_real_mouse:
+            self.recorder.set_block_real_mouse(False)
+
     def toggle_pause(self) -> None:
         if not self.player.playing:
             return
         self.player.toggle_pause()
+        self._update_block()
         if self.player.paused:
             self.btn_pause.configure(text=f"▶  继续  ({self.hk_pause.label()})")
             self.lbl_state.configure(text="已暂停", text_color=WARN)
@@ -861,6 +926,7 @@ class App(ctk.CTk):
 
     def _render_finish(self, reason: str, idx: int) -> None:
         self._last_executed = idx
+        self._update_block()  # 回放结束：放开对真实鼠标的屏蔽
         self.btn_play.configure(state="normal")
         self.btn_pause.configure(state="disabled", text=f"⏸  暂停  ({self.hk_pause.label()})")
         self.btn_stop.configure(state="disabled")
@@ -886,6 +952,9 @@ class App(ctk.CTk):
         self.move_min_distance = int(round(float(value)))
         self.lbl_md.configure(text=f"最小距离  {self.move_min_distance} px")
         self.recorder.move_min_distance = self.move_min_distance
+
+    def _on_record_mode(self, value: str) -> None:
+        self.record_mode_setting = {"自动检测": 0, "绝对坐标": 1, "相对（游戏）": 2}.get(value, 0)
 
     def _on_compress(self) -> None:
         self.compress_on_save = bool(self.var_compress.get())

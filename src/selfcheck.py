@@ -91,7 +91,7 @@ def run() -> tuple[bool, list]:
 
     _check(results, "Tk 窗口渲染", tk_window)
 
-    # 4. 全局键盘钩子
+    # 4. 全局键盘钩子 + Raw Input
     def hooks():
         from .recorder import Recorder
         rec = Recorder()
@@ -99,15 +99,18 @@ def run() -> tuple[bool, list]:
         ok_kb = rec._kb_hook is not None
         rec.start_recording()
         ok_ms = rec._ms_hook is not None
+        ok_raw = rec.raw_ok
         rec.stop_recording()
         rec.stop()
         if not ok_kb:
             raise RuntimeError("键盘钩子安装失败")
         if not ok_ms:
             raise RuntimeError("鼠标钩子安装失败")
-        return "键盘/鼠标钩子均可安装"
+        if not ok_raw:
+            raise RuntimeError("Raw Input 注册失败")
+        return "键盘/鼠标钩子与 Raw Input 均可用"
 
-    _check(results, "全局钩子安装", hooks)
+    _check(results, "全局钩子与 Raw Input", hooks)
 
     # 5. 脚本序列化往返
     def serialize():

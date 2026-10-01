@@ -22,7 +22,7 @@ import threading
 import time
 
 from . import winapi as W
-from .script_io import STRIDE, Script
+from .script_io import MOUSE_MODE_REL, STRIDE, Script
 
 _BTN_DOWN_FLAGS = {
     W.BTN_LEFT: W.MOUSEEVENTF_LEFTDOWN,
@@ -159,6 +159,13 @@ class Player:
         n = script.count
         idx = self.start_index
         speed = self.speed
+        # 相对增量脚本（捕获/隐藏鼠标的游戏）：移动按 SendInput 相对注入，
+        # 点击/滚轮不带移动标志——点击落在当前光标处（=镜头处），不挪动光标。
+        # 绝对脚本（普通程序）：照旧按物理像素坐标注入，手碰鼠标会被下一条
+        # 事件自动拉回。
+        rel_mode = script.mouse_mode == MOUSE_MODE_REL
+        move_flags = 0 if rel_mode else (
+            W.MOUSEEVENTF_MOVE | W.MOUSEEVENTF_ABSOLUTE | W.MOUSEEVENTF_VIRTUALDESK)
         # 只有在拿不到高精度定时器时才抬系统计时器精度：
         # timeBeginPeriod 会抬高全系统定时器中断频率，对正在跑的程序是实打实的开销。
         raised_timer = False
@@ -236,19 +243,25 @@ class Player:
                 if dry:
                     pass
                 elif kind == W.K_MOUSE_MOVE:
-                    self._send_move(ev[base + 1], ev[base + 2])
+                    if not rel_mode:
+                        self._send_move(ev[base + 1], ev[base + 2])
+                elif kind == W.K_MOUSE_REL:
+                    W.send_inputs([W.make_mouse_input(
+                        ev[base + 1], ev[base + 2], 0, W.MOUSEEVENTF_MOVE)])
                 elif kind == W.K_BUTTON_DOWN:
                     btn = ev[base + 1]
-                    self._send_button(btn, True, ev[base + 2], ev[base + 3])
+                    self._send_button(btn, True, ev[base + 2], ev[base + 3], move_flags)
                     down_buttons.add(btn)
                 elif kind == W.K_BUTTON_UP:
                     btn = ev[base + 1]
-                    self._send_button(btn, False, ev[base + 2], ev[base + 3])
+                    self._send_button(btn, False, ev[base + 2], ev[base + 3], move_flags)
                     down_buttons.discard(btn)
                 elif kind == W.K_WHEEL:
-                    self._send_wheel(ev[base + 1], W.MOUSEEVENTF_WHEEL, ev[base + 2], ev[base + 3])
+                    self._send_wheel(ev[base + 1], W.MOUSEEVENTF_WHEEL,
+                                     ev[base + 2], ev[base + 3], move_flags)
                 elif kind == W.K_HWHEEL:
-                    self._send_wheel(ev[base + 1], W.MOUSEEVENTF_HWHEEL, ev[base + 2], ev[base + 3])
+                    self._send_wheel(ev[base + 1], W.MOUSEEVENTF_HWHEEL,
+                                     ev[base + 2], ev[base + 3], move_flags)
                 elif kind == W.K_KEY_DOWN:
                     vk = ev[base + 1]
                     sc = ev[base + 2]
@@ -394,7 +407,7 @@ class Player:
         )])
 
     @staticmethod
-    def _send_wheel(delta: int, flag: int, x: int, y: int) -> None:
+    def _send_wheel(delta: int, flag: int, x: int, y: int, move_flags: int) -> None:
         """下发滚轮事件。
 
         SendInput 的 mouseData 按「有符号 32 位整数」解释滚轮增量，并会被系统
@@ -404,23 +417,26 @@ class Player:
 
         注意：钩子回调那边拿到的事件里增量位于高 16 位，两者约定不同，
         所以录制与回放不能共用同一套编码。
+        相对模式下 move_flags 为 0：只滚轮，不挪动光标。
         """
         data = delta & 0xFFFFFFFF
         ax, ay = W.to_absolute(x, y)
         W.send_inputs([W.make_mouse_input(
-            ax, ay, data,
-            flag | W.MOUSEEVENTF_MOVE | W.MOUSEEVENTF_ABSOLUTE | W.MOUSEEVENTF_VIRTUALDESK,
-        )])
+            ax, ay, data, flag | move_flags)])
 
     @staticmethod
-    def _send_button(btn: int, down: bool, x: int, y: int) -> None:
-        ax, ay = W.to_absolute(x, y)
+    def _send_button(btn: int, down: bool, x: int, y: int, move_flags: int) -> None:
+        """下发鼠标键。绝对模式附带移动到录制坐标；相对模式只发按键
+        （点击落在当前光标处=镜头处），move_flags 为 0。"""
         table = _BTN_DOWN_FLAGS if down else _BTN_UP_FLAGS
         flag = table.get(btn, W.MOUSEEVENTF_XDOWN if down else W.MOUSEEVENTF_XUP)
-        W.send_inputs([W.make_mouse_input(
-            ax, ay, _BTN_DATA.get(btn, 0),
-            flag | W.MOUSEEVENTF_MOVE | W.MOUSEEVENTF_ABSOLUTE | W.MOUSEEVENTF_VIRTUALDESK,
-        )])
+        if move_flags:
+            ax, ay = W.to_absolute(x, y)
+            W.send_inputs([W.make_mouse_input(
+                ax, ay, _BTN_DATA.get(btn, 0), flag | move_flags)])
+        else:
+            W.send_inputs([W.make_mouse_input(
+                0, 0, _BTN_DATA.get(btn, 0), flag)])
 
     def _set_executed(self, idx: int) -> None:
         with self._lock:

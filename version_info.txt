@@ -17,12 +17,12 @@ VSVersionInfo(
         '080404B0',
         [StringStruct('CompanyName', ''),
          StringStruct('FileDescription', '键鼠录制回放工具'),
-         StringStruct('FileVersion', '0.1.0-beta'),
+         StringStruct('FileVersion', '1.0.0'),
          StringStruct('InternalName', 'KeyMouseReplayer'),
          StringStruct('LegalCopyright', ''),
          StringStruct('OriginalFilename', 'KeyMouseReplayer.exe'),
          StringStruct('ProductName', 'KeyMouse Replayer'),
-         StringStruct('ProductVersion', '0.1.0-beta')])
+         StringStruct('ProductVersion', '1.0.0')])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
   ]
