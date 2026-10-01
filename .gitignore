@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# 构建产物（可由 tools/build.ps1 重新生成）
+build/
+dist/
+
+# 开发期临时文件
+_cache/

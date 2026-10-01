@@ -1,0 +1,49 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: '1'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: 核心自测
+        run: python selftest.py core
+
+      - name: 打包并自检产物
+        shell: pwsh
+        run: ./tools/build.ps1
+
+      - name: 读取版本号
+        id: ver
+        shell: pwsh
+        run: |
+          $ver = (python -c "from src.version import __version__; print(__version__)").Trim()
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: 发布 Release（标签 v<版本号> 由 Release 自动创建在本提交上）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
+          files: dist/*.exe
+          generate_release_notes: true
